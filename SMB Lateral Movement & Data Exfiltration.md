@@ -173,7 +173,7 @@ index=* EventCode=4688 New_Process_Name="*powershell.exe*" Process_Command_Line=
 
 Two deliberate choices that make these detections resilient rather than brittle:
 
-- **Behavior over indicator (staging).** Detecting `Access_Mask=0x2` on an admin share catches the *action* of staging a file. Matching the literal filename `sensitive.txt` would be trivially evaded by renaming. Indicators change; the technique doesn't.
+- **Behavior over indicator (staging).** Detecting `Access_Mask=0x2` on an admin share catches the *action* of staging a file. Matching the filename `sensitive.txt` would be evaded by renaming. Indicators change; the technique doesn't.
 - **Host over network (exfil).** Catching the PowerShell outbound request on the endpoint survives encryption and custom C2 channels that would slip past a signature-based IDS. The IDS is a useful second layer, not the primary detection.
 
 ---
