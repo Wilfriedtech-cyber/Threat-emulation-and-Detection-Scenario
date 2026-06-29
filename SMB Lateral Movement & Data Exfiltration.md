@@ -1,5 +1,5 @@
 
-# Scenario 4 — SMB Lateral Movement & Data Exfiltration
+# SMB Lateral Movement & Data Exfiltration
 
 **End-to-end kill-chain emulation and detection engineering in a self-built SOC homelab.**
 
